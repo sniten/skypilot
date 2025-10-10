@@ -425,7 +425,7 @@ def test_invalid_image(enable_all_clouds):
 
     with pytest.raises(ValueError) as e:
         _test_resources(cloud=sky.Lambda(), image_id='some-image')
-    assert 'only supported for AWS/GCP/Azure/IBM/OCI/Kubernetes' in str(e.value)
+    assert 'Lambda cloud only supports Docker images' in str(e.value)
 
 
 def test_valid_image(enable_all_clouds):
@@ -646,6 +646,8 @@ def test_infer_cloud_from_region_or_zone(enable_all_clouds):
 
 def test_ordered_resources(enable_all_clouds):
     captured_output = io.StringIO()
+    # Add fileno() method to avoid issues with executor trying to duplicate fds
+    captured_output.fileno = lambda: 1
     original_stdout = sys.stdout
     try:
         sys.stdout = captured_output  # Redirect stdout to the StringIO object

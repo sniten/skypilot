@@ -316,6 +316,9 @@ class StatusBody(RequestBody):
     all_users: bool = True
     # TODO (kyuds): default to False post 0.10.5
     include_credentials: bool = True
+    # Only return fields that are needed for the
+    # dashboard / CLI summary response
+    summary_response: bool = False
 
 
 class StartBody(RequestBody):
@@ -475,6 +478,17 @@ class VolumeListBody(RequestBody):
     pass
 
 
+class VolumeValidateBody(RequestBody):
+    """The request body for the volume validate endpoint."""
+    name: Optional[str] = None
+    volume_type: Optional[str] = None
+    infra: Optional[str] = None
+    size: Optional[str] = None
+    labels: Optional[Dict[str, str]] = None
+    resource_name: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None
+
+
 class EndpointsBody(RequestBody):
     """The request body for the endpoint."""
     cluster: str
@@ -507,6 +521,14 @@ class JobsLaunchBody(RequestBody):
 
 
 class JobsQueueBody(RequestBody):
+    """The request body for the jobs queue endpoint."""
+    refresh: bool = False
+    skip_finished: bool = False
+    all_users: bool = False
+    job_ids: Optional[List[int]] = None
+
+
+class JobsQueueV2Body(RequestBody):
     """The request body for the jobs queue endpoint."""
     refresh: bool = False
     skip_finished: bool = False
@@ -662,6 +684,13 @@ class LocalUpBody(RequestBody):
     cleanup: bool = False
     context_name: Optional[str] = None
     password: Optional[str] = None
+    name: Optional[str] = None
+    port_start: Optional[int] = None
+
+
+class LocalDownBody(RequestBody):
+    """The request body for the local down endpoint."""
+    name: Optional[str] = None
 
 
 class SSHUpBody(RequestBody):
@@ -701,19 +730,22 @@ class JobsDownloadLogsBody(RequestBody):
 
 class JobsPoolApplyBody(RequestBody):
     """The request body for the jobs pool apply endpoint."""
-    task: str
+    task: Optional[str] = None
+    workers: Optional[int] = None
     pool_name: str
     mode: serve.UpdateMode
 
     def to_kwargs(self) -> Dict[str, Any]:
         kwargs = super().to_kwargs()
-        dag = common.process_mounts_in_task_on_api_server(self.task,
-                                                          self.env_vars,
-                                                          workdir_only=False)
-        assert len(
-            dag.tasks) == 1, ('Must only specify one task in the DAG for '
-                              'a pool.', dag)
-        kwargs['task'] = dag.tasks[0]
+        if self.task is not None:
+            dag = common.process_mounts_in_task_on_api_server(
+                self.task, self.env_vars, workdir_only=False)
+            assert len(
+                dag.tasks) == 1, ('Must only specify one task in the DAG for '
+                                  'a pool.', dag)
+            kwargs['task'] = dag.tasks[0]
+        else:
+            kwargs['task'] = None
         return kwargs
 
 
@@ -784,6 +816,12 @@ class GetConfigBody(RequestBody):
 class CostReportBody(RequestBody):
     """The request body for the cost report endpoint."""
     days: Optional[int] = 30
+    # we use hashes instead of names to avoid the case where
+    # the name is not unique
+    cluster_hashes: Optional[List[str]] = None
+    # Only return fields that are needed for the dashboard
+    # summary page
+    dashboard_summary_response: bool = False
 
 
 class RequestPayload(BasePayload):

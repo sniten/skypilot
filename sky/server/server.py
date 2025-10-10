@@ -38,6 +38,7 @@ from sky import global_user_state
 from sky import models
 from sky import sky_logging
 from sky.data import storage_utils
+from sky.jobs import utils as managed_job_utils
 from sky.jobs.server import server as jobs_rest
 from sky.metrics import utils as metrics_utils
 from sky.provision.kubernetes import utils as kubernetes_utils
@@ -52,6 +53,7 @@ from sky.server import state
 from sky.server import stream_utils
 from sky.server import versions
 from sky.server.auth import authn
+from sky.server.auth import loopback
 from sky.server.auth import oauth2_proxy
 from sky.server.requests import executor
 from sky.server.requests import payloads
@@ -191,6 +193,10 @@ class BasicAuthMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     """Middleware to handle HTTP Basic Auth."""
 
     async def dispatch(self, request: fastapi.Request, call_next):
+        if managed_job_utils.is_consolidation_mode(
+        ) and loopback.is_loopback_request(request):
+            return await call_next(request)
+
         if request.url.path.startswith('/api/health'):
             # Try to set the auth user from basic auth
             _try_set_basic_auth_user(request)
@@ -437,12 +443,28 @@ async def loop_lag_monitor(loop: asyncio.AbstractEventLoop,
         if lag_threshold is not None and lag > lag_threshold:
             logger.warning(f'Event loop lag {lag} seconds exceeds threshold '
                            f'{lag_threshold} seconds.')
-        metrics.SKY_APISERVER_EVENT_LOOP_LAG_SECONDS.labels(
+        metrics_utils.SKY_APISERVER_EVENT_LOOP_LAG_SECONDS.labels(
             pid=pid).observe(lag)
         target = now + interval
         loop.call_at(target, tick)
 
     loop.call_at(target, tick)
+
+
+def schedule_on_boot_check():
+    try:
+        executor.schedule_request(
+            request_id='skypilot-server-on-boot-check',
+            request_name='check',
+            request_body=payloads.CheckBody(),
+            func=sky_check.check,
+            schedule_type=requests_lib.ScheduleType.SHORT,
+            is_skypilot_system=True,
+        )
+    except exceptions.RequestAlreadyExistsError:
+        # Lifespan will be executed in each uvicorn worker process, we
+        # can safely ignore the error if the task is already scheduled.
+        logger.debug('Request skypilot-server-on-boot-check already exists.')
 
 
 @contextlib.asynccontextmanager
@@ -469,8 +491,9 @@ async def lifespan(app: fastapi.FastAPI):  # pylint: disable=redefined-outer-nam
             # Lifespan will be executed in each uvicorn worker process, we
             # can safely ignore the error if the task is already scheduled.
             logger.debug(f'Request {event.id} already exists.')
+    schedule_on_boot_check()
     asyncio.create_task(cleanup_upload_ids())
-    if metrics.METRICS_ENABLED:
+    if metrics_utils.METRICS_ENABLED:
         # Start monitoring the event loop lag in each server worker
         # event loop (process).
         asyncio.create_task(loop_lag_monitor(asyncio.get_event_loop()))
@@ -625,6 +648,9 @@ app.include_router(volumes_rest.router, prefix='/volumes', tags=['volumes'])
 app.include_router(ssh_node_pools_rest.router,
                    prefix='/ssh_node_pools',
                    tags=['ssh_node_pools'])
+# increase the resource limit for the server
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 
 # Increase the limit of files we can open to our hard limit. This fixes bugs
 # where we can not aquire file locks or open enough logs and the API server
@@ -1211,23 +1237,13 @@ async def logs(
         request_body=cluster_job_body,
         func=core.tail_logs,
         schedule_type=requests_lib.ScheduleType.SHORT,
+        request_cluster_name=cluster_job_body.cluster_name,
     )
-    task = asyncio.create_task(executor.execute_request_coroutine(request_task))
-
-    async def cancel_task():
-        try:
-            logger.info('Client disconnected for request: '
-                        f'{request.state.request_id}')
-            task.cancel()
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    # Cancel the task after the request is done or client disconnects
-    background_tasks.add_task(cancel_task)
+    task = executor.execute_request_in_coroutine(request_task)
+    background_tasks.add_task(task.cancel)
     # TODO(zhwu): This makes viewing logs in browser impossible. We should adopt
     # the same approach as /stream.
-    return stream_utils.stream_response(
+    return stream_utils.stream_response_for_long_request(
         request_id=request.state.request_id,
         logs_path=request_task.log_path,
         background_tasks=background_tasks,
@@ -1350,10 +1366,12 @@ def provision_logs(cluster_body: payloads.ClusterNameBody,
     effective_tail = None if tail is None or tail <= 0 else tail
 
     return fastapi.responses.StreamingResponse(
-        content=stream_utils.log_streamer(None,
-                                          log_path,
-                                          tail=effective_tail,
-                                          follow=follow),
+        content=stream_utils.log_streamer(
+            None,
+            log_path,
+            tail=effective_tail,
+            follow=follow,
+            cluster_name=cluster_body.cluster_name),
         media_type='text/plain',
         headers={
             'Cache-Control': 'no-cache, no-transform',
@@ -1415,12 +1433,13 @@ async def local_up(request: fastapi.Request,
 
 
 @app.post('/local_down')
-async def local_down(request: fastapi.Request) -> None:
+async def local_down(request: fastapi.Request,
+                     local_down_body: payloads.LocalDownBody) -> None:
     """Tears down the Kubernetes cluster started by local_up."""
     executor.schedule_request(
         request_id=request.state.request_id,
         request_name='local_down',
-        request_body=payloads.RequestBody(),
+        request_body=local_down_body,
         func=core.local_down,
         schedule_type=requests_lib.ScheduleType.LONG,
     )
@@ -1520,6 +1539,7 @@ async def stream(
                 'X-Accel-Buffering': 'no'
             })
 
+    polling_interval = stream_utils.DEFAULT_POLL_INTERVAL
     # Original plain text streaming logic
     if request_id is not None:
         request_task = await requests_lib.get_request_async(request_id)
@@ -1534,6 +1554,8 @@ async def stream(
             raise fastapi.HTTPException(
                 status_code=404,
                 detail=f'Log of request {request_id!r} has been deleted')
+        if request_task.schedule_type == requests_lib.ScheduleType.LONG:
+            polling_interval = stream_utils.LONG_REQUEST_POLL_INTERVAL
     else:
         assert log_path is not None, (request_id, log_path)
         if log_path == constants.API_SERVER_LOGS:
@@ -1567,18 +1589,24 @@ async def stream(
                     detail=f'Log path {log_path!r} does not exist')
 
         log_path_to_stream = resolved_log_path
+
+    headers = {
+        'Cache-Control': 'no-cache, no-transform',
+        'X-Accel-Buffering': 'no',
+        'Transfer-Encoding': 'chunked'
+    }
+    if request_id is not None:
+        headers[server_constants.STREAM_REQUEST_HEADER] = request_id
+
     return fastapi.responses.StreamingResponse(
         content=stream_utils.log_streamer(request_id,
                                           log_path_to_stream,
                                           plain_logs=format == 'plain',
                                           tail=tail,
-                                          follow=follow),
+                                          follow=follow,
+                                          polling_interval=polling_interval),
         media_type='text/plain',
-        headers={
-            'Cache-Control': 'no-cache, no-transform',
-            'X-Accel-Buffering': 'no',
-            'Transfer-Encoding': 'chunked'
-        },
+        headers=headers,
     )
 
 
@@ -1734,7 +1762,12 @@ async def kubernetes_pod_ssh_proxy(websocket: fastapi.WebSocket,
             return
 
     logger.info(f'Starting port-forward to local port: {local_port}')
+    conn_gauge = metrics_utils.SKY_APISERVER_WEBSOCKET_CONNECTIONS.labels(
+        pid=os.getpid())
+    ssh_failed = False
+    websocket_closed = False
     try:
+        conn_gauge.inc()
         # Connect to the local port
         reader, writer = await asyncio.open_connection('127.0.0.1', local_port)
 
@@ -1742,9 +1775,21 @@ async def kubernetes_pod_ssh_proxy(websocket: fastapi.WebSocket,
             try:
                 async for message in websocket.iter_bytes():
                     writer.write(message)
-                    await writer.drain()
+                    try:
+                        await writer.drain()
+                    except Exception as e:  # pylint: disable=broad-except
+                        # Typically we will not reach here, if the ssh to pod
+                        # is disconnected, ssh_to_websocket will exit first.
+                        # But just in case.
+                        logger.error('Failed to write to pod through '
+                                     f'port-forward connection: {e}')
+                        nonlocal ssh_failed
+                        ssh_failed = True
+                        break
             except fastapi.WebSocketDisconnect:
                 pass
+            nonlocal websocket_closed
+            websocket_closed = True
             writer.close()
 
         async def ssh_to_websocket():
@@ -1752,15 +1797,44 @@ async def kubernetes_pod_ssh_proxy(websocket: fastapi.WebSocket,
                 while True:
                     data = await reader.read(1024)
                     if not data:
+                        if not websocket_closed:
+                            logger.warning('SSH connection to pod is '
+                                           'disconnected before websocket '
+                                           'connection is closed')
+                            nonlocal ssh_failed
+                            ssh_failed = True
                         break
                     await websocket.send_bytes(data)
             except Exception:  # pylint: disable=broad-except
                 pass
-            await websocket.close()
+            try:
+                await websocket.close()
+            except Exception:  # pylint: disable=broad-except
+                # The websocket might has been closed by the client.
+                pass
 
         await asyncio.gather(websocket_to_ssh(), ssh_to_websocket())
     finally:
-        proc.terminate()
+        conn_gauge.dec()
+        reason = ''
+        try:
+            logger.info('Terminating kubectl port-forward process')
+            proc.terminate()
+        except ProcessLookupError:
+            stdout = await proc.stdout.read()
+            logger.error('kubectl port-forward was terminated before the '
+                         'ssh websocket connection was closed. Remaining '
+                         f'output: {str(stdout)}')
+            reason = 'KubectlPortForwardExit'
+            metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
+                pid=os.getpid(), reason='KubectlPortForwardExit').inc()
+        else:
+            if ssh_failed:
+                reason = 'SSHToPodDisconnected'
+            else:
+                reason = 'ClientClosed'
+        metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
+            pid=os.getpid(), reason=reason).inc()
 
 
 @app.get('/all_contexts')
@@ -1774,38 +1848,6 @@ async def all_contexts(request: fastapi.Request) -> None:
         func=core.get_all_contexts,
         schedule_type=requests_lib.ScheduleType.SHORT,
     )
-
-
-@app.get('/gpu-metrics')
-async def gpu_metrics() -> fastapi.Response:
-    """Gets the GPU metrics from multiple external k8s clusters"""
-    contexts = core.get_all_contexts()
-    all_metrics = []
-    successful_contexts = 0
-
-    tasks = [
-        asyncio.create_task(metrics_utils.get_metrics_for_context(context))
-        for context in contexts
-        if context != 'in-cluster'
-    ]
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            logger.error(
-                f'Failed to get metrics for context {contexts[i]}: {result}')
-        else:
-            metrics_text = result
-            all_metrics.append(metrics_text)
-            successful_contexts += 1
-
-    combined_metrics = '\n\n'.join(all_metrics)
-
-    # Return as plain text for Prometheus compatibility
-    return fastapi.Response(
-        content=combined_metrics,
-        media_type='text/plain; version=0.0.4; charset=utf-8')
 
 
 # === Internal APIs ===
@@ -1905,6 +1947,7 @@ if __name__ == '__main__':
 
     from sky.server import uvicorn as skyuvicorn
 
+    logger.info('Initializing SkyPilot API server')
     skyuvicorn.add_timestamp_prefix_for_server_logs()
 
     parser = argparse.ArgumentParser()
@@ -1916,7 +1959,17 @@ if __name__ == '__main__':
     parser.add_argument('--metrics-port', default=9090, type=int)
     cmd_args = parser.parse_args()
     if cmd_args.port == cmd_args.metrics_port:
+        logger.error('port and metrics-port cannot be the same, exiting.')
         raise ValueError('port and metrics-port cannot be the same')
+
+    # Fail fast if the port is not available to avoid corrupt the state
+    # of potential running server instance.
+    # We might reach here because the running server is currently not
+    # responding, thus the healthz check fails and `sky api start` think
+    # we should start a new server instance.
+    if not common_utils.is_port_available(cmd_args.port):
+        logger.error(f'Port {cmd_args.port} is not available, exiting.')
+        raise RuntimeError(f'Port {cmd_args.port} is not available')
 
     # Show the privacy policy if it is not already shown. We place it here so
     # that it is shown only when the API server is started.
@@ -1924,12 +1977,17 @@ if __name__ == '__main__':
 
     # Initialize global user state db
     db_utils.set_max_connections(1)
+    logger.info('Initializing database engine')
     global_user_state.initialize_and_get_db()
+    logger.info('Database engine initialized')
     # Initialize request db
     requests_lib.reset_db_and_logs()
     # Restore the server user hash
+    logger.info('Initializing server user hash')
     _init_or_restore_server_user_hash()
+
     max_db_connections = global_user_state.get_max_db_connections()
+    logger.info(f'Max db connections: {max_db_connections}')
     config = server_config.compute_server_config(cmd_args.deploy,
                                                  max_db_connections)
 

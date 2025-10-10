@@ -515,6 +515,19 @@ def get_request_id(response: 'requests.Response') -> RequestId[T]:
     return RequestId[T](request_id)
 
 
+def get_stream_request_id(
+        response: 'requests.Response') -> Optional[RequestId[T]]:
+    """This is same as the above function, but just for `sdk.stream_and_get.
+    We do this because `/api/stream` may choose the latest request id, and
+    we need to keep track of that information. Request id in this case can
+    be None."""
+    handle_request_error(response)
+    request_id = response.headers.get(server_constants.STREAM_REQUEST_HEADER)
+    if request_id is not None:
+        return RequestId[T](request_id)
+    return None
+
+
 def _start_api_server(deploy: bool = False,
                       host: str = '127.0.0.1',
                       foreground: bool = False,
@@ -538,12 +551,17 @@ def _start_api_server(deploy: bool = False,
 
         # Check available memory before starting the server.
         avail_mem_size_gb: float = common_utils.get_mem_size_gb()
-        if avail_mem_size_gb <= server_constants.MIN_AVAIL_MEM_GB:
+        # pylint: disable=import-outside-toplevel
+        import sky.jobs.utils as job_utils
+        max_memory = (server_constants.MIN_AVAIL_MEM_GB_CONSOLIDATION_MODE
+                      if job_utils.is_consolidation_mode() else
+                      server_constants.MIN_AVAIL_MEM_GB)
+        if avail_mem_size_gb <= max_memory:
             logger.warning(
                 f'{colorama.Fore.YELLOW}Your SkyPilot API server machine only '
                 f'has {avail_mem_size_gb:.1f}GB memory available. '
-                f'At least {server_constants.MIN_AVAIL_MEM_GB}GB is '
-                'recommended to support higher load with better performance.'
+                f'At least {max_memory}GB is recommended to support higher '
+                'load with better performance.'
                 f'{colorama.Style.RESET_ALL}')
 
         args = [sys.executable, *API_SERVER_CMD.split()]
@@ -762,6 +780,7 @@ def check_server_healthy_or_start_fn(deploy: bool = False,
                 os.path.expanduser(constants.API_SERVER_CREATION_LOCK_PATH)):
             # Check again if server is already running. Other processes may
             # have started the server while we were waiting for the lock.
+            get_api_server_status.cache_clear()  # type: ignore[attr-defined]
             api_server_info = get_api_server_status(endpoint)
             if api_server_info.status == ApiServerStatus.UNHEALTHY:
                 _start_api_server(deploy, host, foreground, metrics,
@@ -823,7 +842,7 @@ def process_mounts_in_task_on_api_server(task: str, env_vars: Dict[str, str],
     for task_config in task_configs:
         if task_config is None:
             continue
-        file_mounts_mapping = task_config.get('file_mounts_mapping', {})
+        file_mounts_mapping = task_config.pop('file_mounts_mapping', {})
         if not file_mounts_mapping:
             # We did not mount any files to new paths on the remote server
             # so no need to resolve filepaths.
@@ -931,6 +950,7 @@ def clear_local_api_server_database() -> None:
     db_path = os.path.expanduser(server_constants.API_SERVER_REQUEST_DB_PATH)
     for extension in ['', '-shm', '-wal']:
         try:
+            logger.debug(f'Removing database file {db_path}{extension}')
             os.remove(f'{db_path}{extension}')
         except FileNotFoundError:
             logger.debug(f'Database file {db_path}{extension} not found.')

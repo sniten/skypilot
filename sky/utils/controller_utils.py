@@ -232,6 +232,17 @@ def high_availability_specified(cluster_name: Optional[str]) -> bool:
     if controller is None:
         return False
 
+    if controller.value.controller_type == 'jobs':
+        # pylint: disable-next=import-outside-toplevel
+        from sky.jobs import utils as managed_job_utils
+        if managed_job_utils.is_consolidation_mode():
+            return True
+    elif controller.value.controller_type == 'serve':
+        # pylint: disable-next=import-outside-toplevel
+        from sky.serve import serve_utils
+        if serve_utils.is_consolidation_mode():
+            return True
+
     if skypilot_config.loaded():
         return skypilot_config.get_nested((controller.value.controller_type,
                                            'controller', 'high_availability'),
@@ -495,6 +506,9 @@ def shared_controller_vars_to_fill(
         # before popping allowed_contexts. If it is not on Kubernetes,
         # we may be able to use allowed_contexts.
         local_user_config.pop('allowed_contexts', None)
+        # Remove api_server config so that the controller does not try to use
+        # a remote API server.
+        local_user_config.pop('api_server', None)
         with tempfile.NamedTemporaryFile(
                 delete=False,
                 suffix=_LOCAL_SKYPILOT_CONFIG_PATH_SUFFIX) as temp_file:
@@ -609,15 +623,16 @@ def get_controller_resources(
     controller_resources_to_use: resources.Resources = list(
         controller_resources)[0]
 
-    controller_record = global_user_state.get_cluster_from_name(
+    controller_handle = global_user_state.get_handle_from_cluster_name(
         controller.value.cluster_name)
-    if controller_record is not None:
-        handle = controller_record.get('handle', None)
-        if handle is not None:
+    if controller_handle is not None:
+        if controller_handle is not None:
             # Use the existing resources, but override the autostop config with
             # the one currently specified in the config.
-            controller_resources_to_use = handle.launched_resources.copy(
-                autostop=controller_resources_config_copied.get('autostop'))
+            controller_resources_to_use = (
+                controller_handle.launched_resources.copy(
+                    autostop=controller_resources_config_copied.get('autostop'))
+            )
 
     # If the controller and replicas are from the same cloud (and region/zone),
     # it should provide better connectivity. We will let the controller choose
@@ -712,6 +727,17 @@ def get_controller_resources(
     if not result:
         return {controller_resources_to_use}
     return result
+
+
+def get_controller_mem_size_gb() -> float:
+    try:
+        with open(os.path.expanduser(constants.CONTROLLER_K8S_MEMORY_FILE),
+                  'r',
+                  encoding='utf-8') as f:
+            return float(f.read())
+    except FileNotFoundError:
+        pass
+    return common_utils.get_mem_size_gb()
 
 
 def _setup_proxy_command_on_controller(
